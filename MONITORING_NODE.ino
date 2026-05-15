@@ -37,6 +37,20 @@ void onReceive(const esp_now_recv_info *info, const uint8_t *data, int len) {
   Packet temp;
   memcpy(&temp, data, sizeof(temp));
 
+  // ========== ADDED: Serial output for Python dashboard ==========
+  // Format: NODEID,VAL1,VAL2,SOS,MSG
+  Serial.print(incomingPkt.nodeId);
+  Serial.print(",");
+  Serial.print(incomingPkt.val1);
+  Serial.print(",");
+  Serial.print(incomingPkt.val2);
+  Serial.print(",");
+  Serial.print(incomingPkt.isSOS);
+  Serial.print(",");
+  Serial.println(incomingPkt.msg);
+  // ===============================================================
+
+
   // PRIORITY LOCK: If an SOS is active, ignore "Normal" data for 3 seconds
   if (alertLocked && !temp.isSOS && (millis() - alertTimer < 3000)) return;
 
