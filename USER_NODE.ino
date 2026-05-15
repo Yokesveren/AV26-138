@@ -1,6 +1,179 @@
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_#include <WiFi.h>
+#include <esp_now.h>
 #include <esp_wifi.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "MAX30100_PulseOximeter.h"
+
+#define SOS_BUTTON_PIN 13
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+PulseOximeter pox;
+WiFiServer server(80);
+uint32_t tsLastReport = 0;
+bool sensorActive = false;
+
+uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+typedef struct {
+  char nodeId;
+  float val1;
+  float val2;
+  bool isSOS;
+  char msg[32];
+} Packet;
+
+Packet myData;
+bool webCritical = false;
+char webMsg[32] = "Stable";
+
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: 'Segoe UI', Arial; text-align: center; background: #1a1a1a; color: white; padding: 20px; }
+  .btn { padding: 15px; width: 85%; margin: 10px; font-size: 18px; border-radius: 12px; border: none; font-weight: bold; cursor: pointer; }
+  .mic-btn { background: #3498db; color: white; } 
+  .sos-btn { background: #e74c3c; color: white; } 
+  .safe-btn { background: #2ecc71; color: white; }
+  #transcript { width: 80%; padding: 12px; border-radius: 8px; border: none; margin: 10px; font-size: 16px; background: #333; color: white; }
+</style></head>
+<body>
+  <h2>YOKES MEDICAL HUB</h2>
+  <button class="btn mic-btn" id="micBtn" onclick="toggleDictation()">🎤 START VOICE COMMAND</button>
+  <form action="/get">
+    <input type="text" name="m" id="transcript" placeholder="Voice text will appear here..."><br>
+    <button type="submit" name="s" value="1" class="btn sos-btn">SEND AS SOS</button>
+    <button type="submit" name="s" value="0" class="btn safe-btn">SEND NORMAL Update</button>
+  </form>
+  <script>
+    var recognition;
+    var isListening = false;
+    if (window.hasOwnProperty('webkitSpeechRecognition')) {
+      recognition = new webkitSpeechRecognition();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.onresult = function(e) {
+        var t = "";
+        for (var i = e.resultIndex; i < e.results.length; ++i) {
+          if (e.results[i].isFinal) t += e.results[i][0].transcript;
+        }
+        if(t != "") document.getElementById('transcript').value = t;
+      };
+      recognition.onend = function() {
+        isListening = false;
+        document.getElementById('micBtn').innerHTML = "🎤 START VOICE COMMAND";
+      };
+    }
+    function toggleDictation() {
+      if (isListening) { recognition.stop(); } 
+      else { 
+        document.getElementById('transcript').value = "";
+        recognition.start(); 
+        isListening = true;
+        document.getElementById('micBtn').innerHTML = "🛑 STOP LISTENING";
+      }
+    }
+  </script>
+</body></html>)rawliteral";
+
+void setup() {
+    Serial.begin(115200); // Important: Match this baud rate in your computer model
+    pinMode(SOS_BUTTON_PIN, INPUT_PULLUP);
+
+    Wire.begin(21, 22);
+    display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+    display.clearDisplay();
+    display.setTextColor(WHITE);
+    display.setCursor(0, 10);
+    display.println("NODE F: CONNECTING...");
+    display.display();
+
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP("YOKES_NODE_F", "12345678");
+    server.begin();
+
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_promiscuous(false);
+
+    if (esp_now_init() == ESP_OK) {
+        esp_now_peer_info_t peer = {};
+        memcpy(peer.peer_addr, broadcastAddress, 6);
+        peer.channel = 1;
+        peer.encrypt = false;
+        esp_now_add_peer(&peer);
+    }
+    
+    if(pox.begin()){
+        pox.setIRLedCurrent(MAX30100_LED_CURR_7_6MA);
+        sensorActive = true;
+    }
+    
+    myData.nodeId = 'F';
+}
+
+void loop() {
+    if (sensorActive) pox.update();
+
+    WiFiClient client = server.available();
+    if (client) {
+        String req = client.readStringUntil('\r');
+        if (req.indexOf("GET /get?") != -1) {
+            int msgPos = req.indexOf("m=");
+            int endPos = req.indexOf("&s=");
+            if (msgPos != -1 && endPos != -1) {
+                String rawMsg = req.substring(msgPos + 2, endPos);
+                rawMsg.replace("+", " ");
+                rawMsg.replace("%20", " ");
+                strncpy(webMsg, rawMsg.c_str(), 31);
+                webCritical = (req.substring(endPos + 3, endPos + 4) == "1");
+                tsLastReport = 0; 
+            }
+        }
+        client.println("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n");
+        client.print(index_html);
+        client.stop();
+    }
+
+    if (millis() - tsLastReport > 1000) {
+        float bpm = sensorActive ? pox.getHeartRate() : 0;
+        bool btn = (digitalRead(SOS_BUTTON_PIN) == LOW);
+
+        if (btn || webCritical) {
+            myData.isSOS = true;
+            strncpy(myData.msg, btn ? "PANIC BUTTON" : webMsg, 31);
+        } else {
+            myData.isSOS = (bpm >= 130);
+            strcpy(myData.msg, myData.isSOS ? "CRITICAL BPM" : "Stable");
+        }
+
+        myData.val1 = bpm;
+        myData.val2 = sensorActive ? pox.getSpO2() : 0;
+
+        // --- NEW: DATA OUTPUT FOR COMPUTER MODEL (CSV FORMAT) ---
+        Serial.print(myData.nodeId); Serial.print(",");
+        Serial.print(myData.val1);   Serial.print(",");
+        Serial.print(myData.val2);   Serial.print(",");
+        Serial.print(myData.isSOS);  Serial.print(",");
+        Serial.println(myData.msg);  // Using println here ends the data row
+
+        // OLED Update
+        display.clearDisplay();
+        display.setCursor(0, 0);
+        display.println("YOKES NODE F");
+        display.drawFastHLine(0, 10, 128, WHITE);
+        display.setCursor(0, 25);
+        display.print("BPM: "); display.print((int)myData.val1);
+        display.setCursor(0, 40);
+        display.print("MSG: "); display.print(myData.msg);
+        display.display();
+
+        esp_now_send(broadcastAddress, (uint8_t *) &myData, sizeof(myData));
+        tsLastReport = millis();
+    }
+}wifi.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
